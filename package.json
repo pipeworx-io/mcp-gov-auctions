@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-gov-auctions",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited,",
   "type": "module",
   "main": "src/index.ts",

@@ -191,15 +191,44 @@ function shapeLot(r: LotRow) {
 // Shared filter builder for the active-lot list tools.
 function activeLotFilters(args: Record<string, unknown>): string[] {
   const parts = ['status=eq.active'];
-  const keyword = String(args.keyword ?? '').trim();
-  if (keyword) parts.push(`title=ilike.*${encodeURIComponent(keyword)}*`);
-  const state = String(args.state ?? '').trim();
+  // Accept the common param aliases agents reach for (query/q/search/keywords)
+  // — previously anything but `keyword` was silently ignored, returning the
+  // whole unfiltered pool as if it had matched.
+  parts.push(...titleKeywordParts(args));
+  const state = String(args.state ?? args.location_state ?? '').trim();
   if (state) parts.push(`location_state=eq.${encodeURIComponent(state.toUpperCase())}`);
-  const assetType = String(args.asset_type ?? '').trim();
+  const assetType = normalizeAssetType(String(args.asset_type ?? args.category ?? args.type ?? '').trim());
   if (assetType) parts.push(`asset_type=eq.${encodeURIComponent(assetType)}`);
-  const source = String(args.source ?? '').trim();
+  const source = String(args.source ?? '').trim().toLowerCase();
   if (source) parts.push(`source=eq.${encodeURIComponent(source)}`);
   return parts;
+}
+
+// Keyword → PostgREST title filters, shared by all keyword tools. Accepts the
+// param aliases agents use (query/q/search/keywords), and tokenizes multi-word
+// keywords into AND-ed substring matches so word order/adjacency don't matter.
+function titleKeywordParts(args: Record<string, unknown>): string[] {
+  const keyword = String(args.keyword ?? args.query ?? args.q ?? args.search ?? args.keywords ?? '').trim();
+  if (!keyword) return [];
+  return keyword
+    .split(/\s+/)
+    .filter((t) => t.length >= 2)
+    .slice(0, 6)
+    .map((tok) => `title=ilike.*${encodeURIComponent(tok)}*`);
+}
+
+// Map plural/synonym asset categories agents pass to the enum values.
+function normalizeAssetType(raw: string): string {
+  if (!raw) return '';
+  const t = raw.toLowerCase();
+  const map: Record<string, string> = {
+    vehicles: 'vehicle', car: 'vehicle', cars: 'vehicle', truck: 'vehicle', trucks: 'vehicle', auto: 'vehicle',
+    equipment: 'equipment', machinery: 'equipment', heavy: 'equipment',
+    realestate: 'realestate', 'real estate': 'realestate', property: 'realestate', land: 'realestate',
+    electronics: 'electronics', electronic: 'electronics', computers: 'electronics',
+  };
+  if ((ASSET_TYPES as readonly string[]).includes(t)) return t;
+  return map[t] ?? '';
 }
 
 async function search(cfg: SupabaseConfig, args: Record<string, unknown>) {
@@ -260,11 +289,11 @@ async function lotDetails(cfg: SupabaseConfig, args: Record<string, unknown>) {
 
 async function soldComps(cfg: SupabaseConfig, args: Record<string, unknown>) {
   const parts = ['status=eq.closed', 'final_price=not.is.null'];
-  const keyword = String(args.keyword ?? '').trim();
-  if (keyword) parts.push(`title=ilike.*${encodeURIComponent(keyword)}*`);
-  const assetType = String(args.asset_type ?? '').trim();
+  const keyword = String(args.keyword ?? args.query ?? args.q ?? args.search ?? args.keywords ?? '').trim();
+  parts.push(...titleKeywordParts(args));
+  const assetType = normalizeAssetType(String(args.asset_type ?? args.category ?? args.type ?? '').trim());
   if (assetType) parts.push(`asset_type=eq.${encodeURIComponent(assetType)}`);
-  const state = String(args.state ?? '').trim();
+  const state = String(args.state ?? args.location_state ?? '').trim();
   if (state) parts.push(`location_state=eq.${encodeURIComponent(state.toUpperCase())}`);
 
   // Pull final prices for stats (cap to keep it bounded) + a few recent examples.
