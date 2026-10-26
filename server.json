@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.pipeworx-io/gov-auctions",
   "title": "Gov Auctions",
-  "description": "Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited,",
-  "version": "0.1.3",
+  "description": "Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited, tax-deed) that…",
+  "version": "0.1.4",
   "websiteUrl": "https://pipeworx.io/packs/gov-auctions",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-gov-auctions",

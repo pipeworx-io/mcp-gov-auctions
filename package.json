@@ -1,7 +1,7 @@
 {
   "name": "@pipeworx/mcp-gov-auctions",
-  "version": "0.1.3",
-  "description": "Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited,",
+  "version": "0.1.4",
+  "description": "Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited, tax-deed) that agencies sell to the public. Reads the auction_lots table (ingested daily by workers/auction-scraper) via PostgREST.",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-8031b011dae588570497cd0a81460c41a285768424bcb5f691572ac0ada94342",
-    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
+    "sourceHash": "v1-f1f876a8837ac00d319a1934ecce2b6584ad359f90b5951c04590f38894f9d2b",
+    "sourceCommit": "445bacc5596a845c12d6945fbfcdf330ef60dcc4"
   }
 }

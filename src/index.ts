@@ -25,6 +25,187 @@ interface McpToolExport {
 }
 
 /**
+ * Shared freshness + cross-storefront dedupe logic for the Pipeworx auction
+ * packs (mcps/us-auctions, mcps/gov-auctions), which both read auction_lots /
+ * auction_sources over PostgREST. Self-contained — no imports — so the
+ * standalone-publish inliner (scripts/lib/resolve-shared-helpers.mjs) can pull
+ * it into either pack's published bundle whole.
+ *
+ * STALE-SOURCE WITHHOLDING (ported from mcps/us-auctions, fleet #3065): a lot
+ * is "active" in auction_lots only because the last pass that saw it said so.
+ * When a source stops completing passes nothing says otherwise, so a source
+ * whose last completed pass is older than its schedule's threshold is STALE,
+ * and its lots should be WITHHELD from open-lot tools rather than returned
+ * with a per-row flag — an agent assembling a list of open lots drops
+ * advisory flags and keeps the row. See mcps/us-auctions/src/index.ts's
+ * original commentary for the measured pass-cadence numbers the thresholds
+ * are based on.
+ *
+ * CROSS-STOREFRONT DEDUPE (fleet #3137): GovDeals and AllSurplus are one
+ * Liquidity Services catalogue reached through two storefronts, so a lot can
+ * carry an IDENTICAL source_lot_id under both. The two copies are scraped at
+ * DIFFERENT times and so can disagree (current_bid, bid_count) — keep
+ * whichever was seen MORE RECENTLY (last_seen_at), not a fixed winner: a fixed
+ * winner can silently serve the staler of two snapshots (measured pair
+ * 8445-2-47961: govdeals $160 vs allsurplus $121).
+ */
+
+const AUCTION_STALE_AFTER_MS: Record<string, number> = {
+  '6h': 24 * 3600_000,
+  daily: 50 * 3600_000,
+  weekly: 15 * 24 * 3600_000,
+};
+
+interface AuctionSourceStateRow {
+  source: string;
+  schedule: string | null;
+  last_success_at: string | null;
+  consecutive_failures: number | null;
+  last_error: string | null;
+}
+
+interface AuctionSourceFreshness {
+  source: string;
+  last_success_at: string | null;
+  stale: boolean;
+  stale_after_hours: number;
+  hours_since_success: number | null;
+  consecutive_failures: number;
+  last_error: string | null;
+}
+
+function classifyAuctionFreshness(
+  rows: AuctionSourceStateRow[],
+  nowMs: number,
+): Map<string, AuctionSourceFreshness> {
+  const out = new Map<string, AuctionSourceFreshness>();
+  for (const r of rows) {
+    const after = AUCTION_STALE_AFTER_MS[r.schedule ?? ''] ?? AUCTION_STALE_AFTER_MS.daily;
+    const t = r.last_success_at ? Date.parse(r.last_success_at) : NaN;
+    const age = Number.isFinite(t) ? nowMs - t : null;
+    out.set(r.source, {
+      source: r.source,
+      last_success_at: r.last_success_at,
+      // Never completed a pass is stale too: nothing it holds was confirmed.
+      stale: age === null || age > after,
+      stale_after_hours: after / 3600_000,
+      hours_since_success: age === null ? null : Math.round((age / 3600_000) * 10) / 10,
+      consecutive_failures: r.consecutive_failures ?? 0,
+      last_error: r.last_error ? r.last_error.slice(0, 200) : null,
+    });
+  }
+  return out;
+}
+
+function describeStaleAuctionSource(f: AuctionSourceFreshness): string {
+  const when = f.last_success_at
+    ? `last completed a refresh ${f.last_success_at} (${f.hours_since_success}h ago)`
+    : 'has never completed a refresh';
+  return `${f.source} ${when}`;
+}
+
+/** The disclosure every open-lot response carries when a source was withheld. */
+function staleAuctionDisclosure(
+  stale: AuctionSourceFreshness[],
+  freshnessKnown: boolean,
+): Record<string, unknown> {
+  if (!freshnessKnown) {
+    return {
+      freshness_unverified:
+        'Could not read per-source refresh times, so lots below were NOT checked for staleness. Treat them as last-known listings and confirm on the auction page.',
+    };
+  }
+  if (stale.length === 0) return {};
+  return {
+    withheld_stale_sources: stale.map((f) => ({
+      source: f.source,
+      last_success_at: f.last_success_at,
+      hours_since_success: f.hours_since_success,
+      stale_after_hours: f.stale_after_hours,
+    })),
+    stale_note:
+      `Lots from ${stale.map(describeStaleAuctionSource).join('; ')} are withheld: a source that has not refreshed within ` +
+      `${stale.map((f) => `${f.stale_after_hours}h`).join('/')} cannot vouch that its lots are still open. ` +
+      `Coverage for that source is missing from these results until it refreshes.`,
+  };
+}
+
+// ── Cross-storefront dedupe ─────────────────────────────────────────────────
+
+/** GovDeals and AllSurplus are two storefronts over one maestro API catalogue. */
+const DEFAULT_DUPLICATE_STOREFRONTS = new Set(['govdeals', 'allsurplus']);
+
+/**
+ * Tie-break order used ONLY when last_seen_at is missing or equal on both
+ * copies (e.g. a caller that didn't select the column, or a zip-radius RPC
+ * that doesn't project it). Matches the pre-fleet#3137 fixed preference, so a
+ * caller that cannot supply freshness data gets the same deterministic result
+ * it always did rather than an arbitrary one.
+ */
+const DEFAULT_STOREFRONT_TIEBREAK_ORDER: readonly string[] = ['govdeals', 'allsurplus'];
+
+function parseTimeOrMinusInfinity(v: string | null | undefined): number {
+  if (!v) return -Infinity;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : -Infinity;
+}
+
+interface DedupeAuctionStorefrontsOptions {
+  duplicateStorefronts?: ReadonlySet<string>;
+  tiebreakOrder?: readonly string[];
+}
+
+/**
+ * Drop the second copy of a lot listed on two storefronts of the same
+ * underlying platform (by default govdeals/allsurplus; the same
+ * source_lot_id — the composite accountId-auctionId-assetId — identifies the
+ * same physical lot on both).
+ *
+ * Keeps the FRESHER copy (later last_seen_at). Falls back to tiebreakOrder
+ * (default: govdeals) when last_seen_at is missing or tied on both sides, so
+ * behaviour stays fully deterministic even for a caller that has no freshness
+ * column to offer.
+ *
+ * Preserves the caller's row ORDER: the kept row occupies the position of the
+ * FIRST-seen copy, so a list already sorted (e.g. by closes_at) is not
+ * re-sorted by this pass — only its content may be swapped for the fresher
+ * duplicate's.
+ */
+function dedupeAuctionStorefronts<
+  T extends { source: string; source_lot_id: string; last_seen_at?: string | null },
+>(rows: T[], opts: DedupeAuctionStorefrontsOptions = {}): T[] {
+  const duplicateStorefronts = opts.duplicateStorefronts ?? DEFAULT_DUPLICATE_STOREFRONTS;
+  const tiebreakOrder = opts.tiebreakOrder ?? DEFAULT_STOREFRONT_TIEBREAK_ORDER;
+  const rankOf = (source: string): number => {
+    const i = tiebreakOrder.indexOf(source);
+    return i === -1 ? tiebreakOrder.length : i;
+  };
+
+  const indexByKey = new Map<string, number>();
+  const out: T[] = [];
+  for (const r of rows) {
+    if (!duplicateStorefronts.has(r.source)) {
+      out.push(r);
+      continue;
+    }
+    const key = r.source_lot_id;
+    const existingIdx = indexByKey.get(key);
+    if (existingIdx === undefined) {
+      indexByKey.set(key, out.length);
+      out.push(r);
+      continue;
+    }
+    const existing = out[existingIdx];
+    const rTime = parseTimeOrMinusInfinity(r.last_seen_at);
+    const eTime = parseTimeOrMinusInfinity(existing.last_seen_at);
+    const rIsBetter = rTime !== eTime ? rTime > eTime : rankOf(r.source) < rankOf(existing.source);
+    if (rIsBetter) out[existingIdx] = r;
+  }
+  return out;
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -295,10 +476,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -670,6 +867,262 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+
+
+type SourceStateRow = AuctionSourceStateRow;
+type SourceFreshness = AuctionSourceFreshness;
+const classifyFreshness = classifyAuctionFreshness;
+const describeStale = describeStaleAuctionSource;
+const staleDisclosure = staleAuctionDisclosure;
+const dedupeStorefronts = dedupeAuctionStorefronts;
 /**
  * Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited,
  * tax-deed) that agencies sell to the public. Reads the
@@ -847,15 +1300,93 @@ interface LotRow {
   status: string;
   seller_agency: string | null;
   url: string | null;
+  // Not shaped into any tool's output — read only so dedupeStorefronts can
+  // pick the fresher of two cross-listed govdeals/allsurplus copies.
+  last_seen_at: string | null;
 }
 
 const LOT_SELECT =
-  'select=source,source_lot_id,title,category,asset_type,location_city,location_state,location_zip,currency,current_bid,bid_count,closes_at,status,seller_agency,url';
+  'select=source,source_lot_id,title,category,asset_type,location_city,location_state,location_zip,currency,current_bid,bid_count,closes_at,status,seller_agency,url,last_seen_at';
+
+// ── Source freshness (ported from mcps/us-auctions, fleet #3065 -> #3137) ──
+//
+// gov-auctions reads the SAME auction_lots/auction_sources tables as
+// us-auctions but never got the stale-source withholding that pack carries:
+// a source whose last completed pass is older than its schedule's threshold
+// is STALE, and its lots are WITHHELD from the open-lot tools (search,
+// closing_soon) rather than returned with a per-row flag that an agent
+// assembling "lots you can bid on now" would drop and keep the row anyway.
+// classifyFreshness/describeStale/staleDisclosure/their thresholds live in
+
+// One small read (one row per source) per call, cached per isolate for a
+// minute: freshness moves on the scale of hours, and every search needs it.
+let freshnessCache: { at: number; map: Map<string, SourceFreshness> } | null = null;
+const FRESHNESS_TTL_MS = 60_000;
+
+async function sourceFreshness(cfg: SupabaseConfig): Promise<Map<string, SourceFreshness> | null> {
+  const now = Date.now();
+  if (freshnessCache && now - freshnessCache.at < FRESHNESS_TTL_MS) return freshnessCache.map;
+  try {
+    const rows = await pg<SourceStateRow[]>(
+      cfg,
+      'auction_sources',
+      'select=source,schedule,last_success_at,consecutive_failures,last_error&limit=200',
+    );
+    const map = classifyFreshness(rows, now);
+    freshnessCache = { at: now, map };
+    return map;
+  } catch {
+    // Cannot tell is not "fresh". The caller says so in the response.
+    return null;
+  }
+}
+
+function staleList(fresh: Map<string, SourceFreshness> | null): SourceFreshness[] {
+  return fresh ? [...fresh.values()].filter((f) => f.stale) : [];
+}
+
+/**
+ * Wrap an open-lot tool so stale sources are excluded at the QUERY (not just
+ * filtered after the LIMIT, which would shrink pages unpredictably) and the
+ * response names what was withheld. Mirrors us-auctions' withFreshLots.
+ */
+async function withFreshLots(
+  cfg: SupabaseConfig,
+  args: Record<string, unknown>,
+  run: (args: Record<string, unknown>) => Promise<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  const fresh = await sourceFreshness(cfg);
+  const stale = staleList(fresh);
+  const named = String(args.source ?? '').trim().toLowerCase();
+  const namedStale = named ? stale.find((f) => f.source === named) : undefined;
+  if (namedStale) {
+    return {
+      count: 0,
+      lots: [],
+      source_stale: true,
+      ...staleDisclosure([namedStale], true),
+      message: `No open lots can be reported for ${named}: it ${describeStale(namedStale).slice(named.length + 1)}, so its listings may have closed or changed since. This is a stale source, not an empty one.`,
+    };
+  }
+  const result = await run({ ...args, _exclude_sources: named ? [] : stale.map((f) => f.source) });
+  if ('error' in result) return result;
+  return { ...result, ...staleDisclosure(named ? [] : stale, fresh !== null) };
+}
 
 function clampInt(v: unknown, lo: number, hi: number, dflt: number): number {
   const n = Number(v);
   if (!Number.isFinite(n)) return dflt;
   return Math.min(Math.max(Math.trunc(n), lo), hi);
+}
+
+/**
+ * How many rows to ask for so that `limit` SURVIVE dedupeStorefronts. GovDeals
+ * and AllSurplus are two storefronts over one catalogue (mcps/us-auctions'
+ * dedupeStorefronts commentary has the measured ~94% overlap), so a plain
+ * fetch of `limit` rows can come back nearly half empty post-dedupe.
+ */
+function overFetch(limit: number): number {
+  return Math.min(limit * 2, 200);
 }
 
 function shapeLot(r: LotRow) {
@@ -889,6 +1420,14 @@ function activeLotFilters(args: Record<string, unknown>): string[] {
   if (assetType) parts.push(`asset_type=eq.${encodeURIComponent(assetType)}`);
   const source = String(args.source ?? '').trim().toLowerCase();
   if (source) parts.push(`source=eq.${encodeURIComponent(source)}`);
+  // Stale sources (withFreshLots). Top-level `not.in` — no enclosing group for
+  // the commas to escape into — and the values are quoted anyway.
+  const exclude = Array.isArray(args._exclude_sources)
+    ? (args._exclude_sources as unknown[]).map(String).filter((x) => /^[a-z0-9-]+$/.test(x))
+    : [];
+  if (!source && exclude.length > 0) {
+    parts.push(`source=not.in.(${exclude.map((x) => encodeURIComponent(`"${x}"`)).join(',')})`);
+  }
   return parts;
 }
 
@@ -931,8 +1470,9 @@ async function search(cfg: SupabaseConfig, args: Record<string, unknown>) {
     const cutoff = new Date(Date.now() + Number(args.closing_within_hours) * 3600_000).toISOString();
     parts.push(`closes_at=lte.${cutoff}`);
     parts.push(`closes_at=gte.${nowIso}`);
-    parts.push(LOT_SELECT, 'order=closes_at.asc.nullslast', `limit=${limit}`);
-    const rows = await pg<LotRow[]>(cfg, 'auction_lots', parts.join('&'));
+    parts.push(LOT_SELECT, 'order=closes_at.asc.nullslast', `limit=${overFetch(limit)}`);
+    const raw = await pg<LotRow[]>(cfg, 'auction_lots', parts.join('&'));
+    const rows = dedupeStorefronts(raw).slice(0, limit);
     return { count: rows.length, lots: rows.map(shapeLot) };
   }
 
@@ -954,21 +1494,23 @@ async function search(cfg: SupabaseConfig, args: Record<string, unknown>) {
   // was for sale while the table held live lots. Two index-friendly passes
   // return the identical rows in the identical order, because `nullslast` puts
   // every null-close lot after every dated one anyway.
+  const want = overFetch(limit);
   const dated = await pg<LotRow[]>(
     cfg,
     'auction_lots',
-    [...parts, `closes_at=gte.${nowIso}`, LOT_SELECT, 'order=closes_at.asc', `limit=${limit}`].join('&'),
+    [...parts, `closes_at=gte.${nowIso}`, LOT_SELECT, 'order=closes_at.asc', `limit=${want}`].join('&'),
   );
-  const rows =
-    dated.length >= limit
+  const raw =
+    dated.length >= want
       ? dated
       : dated.concat(
           await pg<LotRow[]>(
             cfg,
             'auction_lots',
-            [...parts, 'closes_at=is.null', LOT_SELECT, `limit=${limit - dated.length}`].join('&'),
+            [...parts, 'closes_at=is.null', LOT_SELECT, `limit=${want - dated.length}`].join('&'),
           ),
         );
+  const rows = dedupeStorefronts(raw).slice(0, limit);
   return { count: rows.length, lots: rows.map(shapeLot) };
 }
 
@@ -976,8 +1518,9 @@ async function closingSoon(cfg: SupabaseConfig, args: Record<string, unknown>) {
   const parts = activeLotFilters(args);
   parts.push('closes_at=gte.' + new Date().toISOString());
   const limit = clampInt(args.limit, 1, 100, 25);
-  parts.push(LOT_SELECT, 'order=closes_at.asc.nullslast', `limit=${limit}`);
-  const rows = await pg<LotRow[]>(cfg, 'auction_lots', parts.join('&'));
+  parts.push(LOT_SELECT, 'order=closes_at.asc.nullslast', `limit=${overFetch(limit)}`);
+  const raw = await pg<LotRow[]>(cfg, 'auction_lots', parts.join('&'));
+  const rows = dedupeStorefronts(raw).slice(0, limit);
   const now = Date.now();
   return {
     count: rows.length,
@@ -1037,11 +1580,13 @@ async function soldComps(cfg: SupabaseConfig, args: Record<string, unknown>) {
   const median = prices[Math.floor(prices.length / 2)];
   const avg = Math.round(prices.reduce((s, n) => s + n, 0) / prices.length);
   const exLimit = clampInt(args.limit, 1, 50, 10);
-  const examples = await pg<LotRow[]>(
+  const EX_SELECT = 'select=source,source_lot_id,title,location_state,final_price,closes_at,url,last_seen_at';
+  const rawEx = await pg<LotRow[]>(
     cfg,
     'auction_lots',
-    [...parts, 'select=title,location_state,final_price,closes_at,url', 'order=closes_at.desc', `limit=${exLimit}`].join('&'),
+    [...parts, EX_SELECT, 'order=closes_at.desc', `limit=${overFetch(exLimit)}`].join('&'),
   );
+  const examples = dedupeStorefronts(rawEx).slice(0, exLimit);
   return {
     matched_lots: prices.length,
     final_price: { min: prices[0], median, average: avg, max: prices[prices.length - 1], currency: 'USD' },
@@ -1056,24 +1601,32 @@ async function soldComps(cfg: SupabaseConfig, args: Record<string, unknown>) {
 }
 
 async function coverage(cfg: SupabaseConfig) {
-  const sources = await pg<Array<{ source: string; last_success_at: string | null }>>(
+  const sourceRows = await pg<SourceStateRow[]>(
     cfg,
     'auction_sources',
-    'select=source,last_success_at&limit=200',
+    'select=source,schedule,last_success_at,consecutive_failures,last_error&limit=200',
   );
-  const freshness = new Map(sources.map((s) => [s.source, s.last_success_at]));
+  const freshness = classifyFreshness(sourceRows, Date.now());
   const perSource = await Promise.all(
-    KNOWN_SOURCES.map(async (source) => ({
-      source,
-      // No GOV_SEGMENT here, deliberately, and it is not a hole in the rule
-      // above: every entry in KNOWN_SOURCES *is* a government source, so
-      // source=eq.<x> already implies segment=government and the extra
-      // predicate can only ever be true. It was not free, though — carrying it
-      // was the difference between this count timing out and us-auctions'
-      // identical count succeeding on a source 15x larger (fleet #1081).
-      active_lots: await pgCount(cfg, 'auction_lots', `status=eq.active&source=eq.${source}`),
-      last_refreshed_at: freshness.get(source) ?? null,
-    })),
+    KNOWN_SOURCES.map(async (source) => {
+      const f = freshness.get(source);
+      return {
+        source,
+        // No GOV_SEGMENT here, deliberately, and it is not a hole in the rule
+        // above: every entry in KNOWN_SOURCES *is* a government source, so
+        // source=eq.<x> already implies segment=government and the extra
+        // predicate can only ever be true. It was not free, though — carrying it
+        // was the difference between this count timing out and us-auctions'
+        // identical count succeeding on a source 15x larger (fleet #1081).
+        active_lots: await pgCount(cfg, 'auction_lots', `status=eq.active&source=eq.${source}`),
+        last_refreshed_at: f?.last_success_at ?? null,
+        last_success_at: f?.last_success_at ?? null,
+        // No state row at all is stale: the scraper has never reported it.
+        stale: f ? f.stale : true,
+        stale_after_hours: f?.stale_after_hours ?? AUCTION_STALE_AFTER_MS.daily / 3600_000,
+        hours_since_success: f?.hours_since_success ?? null,
+      };
+    }),
   );
   // GOV_SEGMENT is NOT redundant here: comps span both segments.
   const soldComps = await pgCount(cfg, 'auction_lots', `status=eq.closed&final_price=not.is.null&${GOV_SEGMENT}`);
@@ -1082,8 +1635,20 @@ async function coverage(cfg: SupabaseConfig) {
   // named instead, so the total reads as an explicit partial rather than as a
   // smaller number presented as a complete one.
   const uncounted = perSource.filter((s) => s.active_lots === null).map((s) => s.source);
+  const freshSources = perSource.filter((s) => !s.stale);
+  const staleSources = perSource.filter((s) => s.stale);
+  // Stale-source withholding (ported from mcps/us-auctions, fleet #3065 ->
+  // #3137): a source whose last completed pass is too old cannot vouch its
+  // lots are still open, so it is excluded from total_active_lots — the same
+  // rule that excludes its lots from auctions_search/auctions_closing_soon.
+  const totalActiveLotsFresh = freshSources.every((s) => s.active_lots !== null)
+    ? freshSources.reduce((s, c) => s + (c.active_lots ?? 0), 0)
+    : null;
+  const totalActiveLotsIncludingStale = perSource.every((s) => s.active_lots !== null)
+    ? perSource.reduce((s, c) => s + (c.active_lots ?? 0), 0)
+    : null;
   return {
-    total_active_lots: perSource.reduce((s, c) => s + (c.active_lots ?? 0), 0),
+    total_active_lots: totalActiveLotsFresh,
     ...(uncounted.length
       ? {
           total_active_lots_partial:
@@ -1091,6 +1656,22 @@ async function coverage(cfg: SupabaseConfig) {
             `are UNCOUNTED, and they contribute 0 to total_active_lots. Call auctions_search or ` +
             `auctions_closing_soon to confirm a source is live.`,
           uncounted_sources: uncounted,
+        }
+      : {}),
+    ...(staleSources.length
+      ? {
+          total_active_lots_including_stale: totalActiveLotsIncludingStale,
+          stale_sources: staleSources.map((s) => ({
+            source: s.source,
+            last_success_at: s.last_success_at,
+            hours_since_success: s.hours_since_success,
+            active_lots: s.active_lots,
+          })),
+          stale_note:
+            `${staleSources.map((s) => s.source).join(', ')} ${staleSources.length === 1 ? 'has' : 'have'} not completed a refresh ` +
+            `within ${staleSources.map((s) => `${s.stale_after_hours}h`).join('/')}, so lots marked active there are last-known ` +
+            `listings, not confirmed open ones. They are excluded from total_active_lots and withheld from search results. ` +
+            `total_active_lots_including_stale is the old headline.`,
         }
       : {}),
     sold_comps_retained: soldComps,
@@ -1102,7 +1683,7 @@ async function coverage(cfg: SupabaseConfig) {
         }
       : {}),
     sources: perSource,
-    note: 'Data is refreshed daily. Sold-price comps (auctions_sold_comps) retain closed lots indefinitely. An active_lots of null means the count did not complete, not that the source is empty.',
+    note: 'Data is refreshed daily. Sold-price comps (auctions_sold_comps) retain closed lots indefinitely. An active_lots of null means the count did not complete, not that the source is empty. GovDeals and AllSurplus are two storefronts over one catalogue — search results are de-duplicated, but these per-source counts are raw and overlap.',
   };
 }
 
@@ -1116,9 +1697,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 
   switch (name) {
     case 'auctions_search':
-      return search(cfg, args);
+      return withFreshLots(cfg, args, (a) => search(cfg, a) as Promise<Record<string, unknown>>);
     case 'auctions_closing_soon':
-      return closingSoon(cfg, args);
+      return withFreshLots(cfg, args, (a) => closingSoon(cfg, a) as Promise<Record<string, unknown>>);
     case 'auction_lot_details':
       return lotDetails(cfg, args);
     case 'auctions_sold_comps':
