@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-gov-auctions",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited, tax-deed) that agencies sell to the public. Reads the auction_lots table (ingested daily by workers/auction-scraper) via PostgREST.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-gov-auctions": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "gov-auctions"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-gov-auctions.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/gov-auctions",
   "pipeworx": {
-    "sourceHash": "v1-f1f876a8837ac00d319a1934ecce2b6584ad359f90b5951c04590f38894f9d2b",
-    "sourceCommit": "445bacc5596a845c12d6945fbfcdf330ef60dcc4"
+    "mode": "gateway",
+    "slug": "gov-auctions",
+    "gatewaySlug": "gov-auctions",
+    "sourceHash": "v1-f5def08c521bee0f3f958f391699727e29d4af16166cfa34834d510950d87242",
+    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
   }
 }
