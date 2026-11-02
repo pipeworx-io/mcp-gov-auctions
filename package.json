@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-gov-auctions",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Government Auctions MCP — physical-asset auctions (surplus, seized, forfeited, tax-deed) that agencies sell to the public. Reads the auction_lots table (ingested daily by workers/auction-scraper) via PostgREST.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "gov-auctions",
     "gatewaySlug": "gov-auctions",
-    "sourceHash": "v1-f5def08c521bee0f3f958f391699727e29d4af16166cfa34834d510950d87242",
-    "sourceCommit": "4844029e402d6bd2fe735add8abf6d46735f8ed5"
+    "sourceHash": "v1-4fb41a13364307a6490df7e7a83c615ac656ec388e247d468963c43310d1347c",
+    "sourceCommit": "030233f6b150a38a44421f88a5fcbad123f0fea8"
   }
 }
